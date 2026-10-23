@@ -2,3 +2,6 @@ node_modules
 .env*
 !.env.example
 *.log
+# Admin uploads live here; the seeded catalogue images are committed.
+uploads/*
+!uploads/seed/
