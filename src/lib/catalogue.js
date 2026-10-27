@@ -11,7 +11,7 @@ export const HIGHLIGHT_KEYS = ['bestFor', 'scentVibe', 'keyHighlights'];
 export const SPEC_KEYS = ['top', 'heart', 'base', 'longevity', 'type', 'sillage'];
 const blank = (keys) => Object.fromEntries(keys.map((k) => [k, '']));
 
-const shape = (p, sizes, { admin = false } = {}) => {
+const shape = (p, sizes, { admin = false, soldBySize } = {}) => {
   const images = json(p.images, {});
   const detail = json(p.detail, {});
   return {
@@ -26,7 +26,7 @@ const shape = (p, sizes, { admin = false } = {}) => {
         label: s.label,
         price: s.price,
         salePrice: s.sale_price,
-        ...(admin && { isActive: Boolean(s.is_active) }),
+        ...(admin && { isActive: Boolean(s.is_active), unitsSold: soldBySize?.get(`${p.id}|${s.label}`) ?? 0 }),
       })),
     excerpt: p.excerpt ?? '',
     notes: json(p.notes, []),
@@ -83,20 +83,26 @@ export const loadAdminProducts = async (conn = pool, { slug } = {}) => {
   const ids = products.map((p) => p.id);
   const [sizes] = await conn.query('SELECT * FROM product_sizes WHERE product_id IN (?) ORDER BY id', [ids]);
   const [sales] = await conn.query(
-    `SELECT oi.product_id,
+    `SELECT oi.product_id, oi.size_label,
             SUM(CASE WHEN o.status <> 'cancelled' THEN oi.qty ELSE 0 END) AS sold
        FROM order_items oi JOIN orders o ON o.id = oi.order_id
       WHERE oi.product_id IN (?)
-      GROUP BY oi.product_id`,
+      GROUP BY oi.product_id, oi.size_label`,
     [ids],
   );
-  const salesOf = new Map(sales.map((s) => [s.product_id, s]));
+  // Units sold per product and per "product|size" (sizes match on label).
+  const soldOf = new Map();
+  const soldBySize = new Map();
+  for (const s of sales) {
+    soldOf.set(s.product_id, (soldOf.get(s.product_id) ?? 0) + Number(s.sold));
+    soldBySize.set(`${s.product_id}|${s.size_label}`, Number(s.sold));
+  }
   return products.map((p) => ({
-    ...shape(p, sizes, { admin: true }),
+    ...shape(p, sizes, { admin: true, soldBySize }),
     isActive: Boolean(p.is_active),
     unitCost: p.unit_cost ?? 0,
-    unitsSold: Number(salesOf.get(p.id)?.sold ?? 0),
-    hasOrders: salesOf.has(p.id),
+    unitsSold: soldOf.get(p.id) ?? 0,
+    hasOrders: soldOf.has(p.id),
     createdAt: p.created_at,
     updatedAt: p.updated_at,
   }));

@@ -161,12 +161,17 @@ CREATE TABLE IF NOT EXISTS stock_purchases (
   product_name VARCHAR(120) NOT NULL,
   qty INT UNSIGNED NOT NULL,
   unit_cost INT UNSIGNED NOT NULL,
+  total_cost INT UNSIGNED NOT NULL DEFAULT 0,
+  costs JSON NULL,                             -- optional breakdown: [{ label, amount }]
   supplier VARCHAR(120) NOT NULL DEFAULT '',
   note VARCHAR(200) NOT NULL DEFAULT '',
   purchased_on DATE NOT NULL,
+  status ENUM('ordered','received') NOT NULL DEFAULT 'received',
+  received_on DATE NULL DEFAULT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_purchases_on (purchased_on),
+  KEY idx_purchases_status (status),
   CONSTRAINT fk_purchase_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

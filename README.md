@@ -13,6 +13,13 @@ npm start       # production
 
 Copy `.env.example` to `.env` and fill it in. `JWT_SECRET` is required (32+ chars).
 
+**Deploying:** `CORS_ORIGINS` must list the live storefront and admin
+origins (e.g. `https://veliorfragrances.com,https://admin.veliorfragrances.com`;
+`www.` variants are matched automatically). If the storefront's origin is
+missing, the browser blocks every request and the site shows "Can't reach
+the server" and its bundled (old) prices. Set `PUBLIC_URL` to the API's own
+public URL so product images resolve.
+
 ## Database
 
 Fresh database:
@@ -24,9 +31,10 @@ mysql -u <user> -p velior_fragrances < db/seed.sql
 
 Existing database from before the admin panel: run `db/migrations/002_admin.sql`,
 then `db/migrations/003_cleanup.sql` (removes development test data and the old
-`is_dummy` flag), `004_customer_gender.sql` and `005_finance.sql` (order
-channel, unit costs, stock purchases, expenses, partner stores), once each, in
-that order.
+`is_dummy` flag), `004_customer_gender.sql`, `005_finance.sql` (order
+channel, unit costs, stock purchases, expenses, partner stores) and
+`006_production.sql` (production batches: cost breakdown, in-production
+status), once each, in that order.
 
 Create an admin login — this prints the SQL, it doesn't touch the DB:
 

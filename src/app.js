@@ -12,20 +12,31 @@ import { UPLOAD_DIR } from './lib/media.js';
 
 const app = express();
 
-// Behind a proxy (Render, Nginx…) set TRUST_PROXY=1 so rate limits see the real client IP.
-if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+// Production runs behind Nginx on the same machine, so trust X-Forwarded-For
+// from loopback by default — otherwise every customer shares Nginx's IP and
+// one rate-limit bucket (10 orders an hour for the whole site). TRUST_PROXY
+// overrides it (e.g. 1 for a proxy on another host).
+app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY || 'loopback');
 
-const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:5174')
+// CORS_ORIGINS: comma-separated, e.g. "https://veliorfragrances.com,https://admin.veliorfragrances.com".
+// A trailing slash is ignored, "www." and bare domains count as the same
+// site, and "*" matches one subdomain level ("https://*.vercel.app").
+// The live storefront and admin are always allowed, whatever the env says.
+const LIVE_ORIGINS = 'https://veliorfragrances.com,https://admin.veliorfragrances.com';
+const allowedOrigins = `${LIVE_ORIGINS},${process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:5174'}`
   .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
+  .map((o) => o.trim().replace(/\/+$/, '').replace('://www.', '://'))
+  .filter(Boolean)
+  .map((o) => new RegExp(`^${o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+')}$`, 'i'));
+
+const isAllowedOrigin = (origin) => allowedOrigins.some((re) => re.test(origin.replace('://www.', '://')));
 
 const fail = (message) => ({ isRequestSuccessful: false, message, successResponse: null });
 const limiter = (windowMinutes, limit, message) =>
   rateLimit({ windowMs: windowMinutes * 60_000, limit, standardHeaders: true, legacyHeaders: false, message: fail(message) });
 
 app.use(helmet());
-app.use(cors({ origin: allowedOrigins }));
+app.use(cors({ origin: (origin, done) => done(null, !origin || isAllowedOrigin(origin)) }));
 
 // Product images, loaded by the storefront and admin from other origins.
 app.use(
@@ -36,6 +47,13 @@ app.use(
   },
   express.static(UPLOAD_DIR, { immutable: true, maxAge: '365d', index: false, fallthrough: false }),
 );
+
+// Prices and stock change from the admin at any time — never let a browser
+// or proxy serve an old copy.
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ isRequestSuccessful: true, message: null, successResponse: { status: 'ok' } });
