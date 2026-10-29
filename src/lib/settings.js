@@ -20,11 +20,20 @@ export const DEFAULTS = {
     instagram: 'https://instagram.com',
     facebook: 'https://facebook.com',
     tiktok: 'https://tiktok.com',
-    youtube: 'https://youtube.com',
     linkedin: 'https://linkedin.com',
-    twitter: 'https://twitter.com',
+    // Behind the storefront's "Write a review" button (empty hides it).
+    googleReview: '',
   },
   stats: { fragrancesSold: 1000, ordersInQueue: 120, positiveRating: 98.5, googleReviews: 136 },
+  // Printed on partner invoices (admin only).
+  invoice: {
+    accountNo: '0104306225392',
+    accountTitle: 'Usman Haider',
+    bank: 'UBL',
+    website: 'www.veliorfragrances.com',
+    instagram: '@veliorfragrances',
+    phone: '03025009486',
+  },
 };
 
 const whole = (label, max = 10_000_000) =>
@@ -67,6 +76,14 @@ export const sectionSchemas = {
     positiveRating: z.number({ error: 'Enter a rating' }).min(0).max(100, 'Use a percentage up to 100'),
     googleReviews: whole('number'),
   }),
+  invoice: z.object({
+    accountNo: z.string().trim().max(40),
+    accountTitle: z.string().trim().max(80),
+    bank: z.string().trim().max(80),
+    website: z.string().trim().max(80),
+    instagram: z.string().trim().max(60),
+    phone: z.string().trim().max(20),
+  }),
 };
 
 export const settingsPatchSchema = z
@@ -79,7 +96,11 @@ export const loadSettings = async (conn = pool) => {
     rows.map((r) => [r.section, typeof r.data === 'string' ? JSON.parse(r.data) : r.data]),
   );
   return Object.fromEntries(
-    Object.entries(DEFAULTS).map(([section, defaults]) => [section, { ...defaults, ...stored[section] }]),
+    Object.entries(DEFAULTS).map(([section, defaults]) => [
+      section,
+      // Only the keys a section still has — dropped ones (old YouTube/Twitter links) stay hidden.
+      Object.fromEntries(Object.keys(defaults).map((k) => [k, stored[section]?.[k] ?? defaults[k]])),
+    ]),
   );
 };
 

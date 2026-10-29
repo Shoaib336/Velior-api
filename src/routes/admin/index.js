@@ -14,6 +14,7 @@ import settingsRoutes from './settings.js';
 import stockPurchaseRoutes from './stockPurchases.js';
 import expenseRoutes from './expenses.js';
 import partnerStoreRoutes from './partnerStores.js';
+import partnerInvoiceRoutes from './partnerInvoices.js';
 
 const router = Router();
 
@@ -31,6 +32,7 @@ router.use(
   stockPurchaseRoutes,
   expenseRoutes,
   partnerStoreRoutes,
+  partnerInvoiceRoutes,
 );
 
 export default router;

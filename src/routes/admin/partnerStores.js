@@ -50,6 +50,16 @@ const shape = (s) => ({
   address: s.address,
   isActive: Boolean(s.is_active),
   createdAt: s.created_at,
+  // What the store has been billed and paid, from its invoices (list only).
+  ...(s.business !== undefined && {
+    totals: {
+      invoices: Number(s.invoices),
+      units: Number(s.units),
+      business: Number(s.business),
+      received: Number(s.received),
+      pending: Math.max(0, Number(s.business) - Number(s.received)),
+    },
+  }),
 });
 
 const loadOne = async (id) => {
@@ -59,7 +69,18 @@ const loadOne = async (id) => {
 };
 
 router.get('/partner-stores', async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM partner_stores ORDER BY is_active DESC, name');
+  const [rows] = await pool.query(
+    `SELECT s.*,
+            COALESCE(i.invoices, 0) AS invoices, COALESCE(i.units, 0) AS units,
+            COALESCE(i.business, 0) AS business, COALESCE(p.received, 0) AS received
+       FROM partner_stores s
+       LEFT JOIN (SELECT store_id, COUNT(*) AS invoices, SUM(items_count) AS units, SUM(total) AS business
+                    FROM partner_invoices GROUP BY store_id) i ON i.store_id = s.id
+       LEFT JOIN (SELECT pi.store_id, SUM(pp.amount) AS received
+                    FROM partner_payments pp JOIN partner_invoices pi ON pi.id = pp.invoice_id
+                   GROUP BY pi.store_id) p ON p.store_id = s.id
+      ORDER BY s.is_active DESC, s.name`,
+  );
   ok(res, { stores: rows.map(shape) });
 });
 
@@ -86,7 +107,12 @@ router.patch('/partner-stores/:id', async (req, res) => {
 });
 
 router.delete('/partner-stores/:id', async (req, res) => {
-  const [result] = await pool.query('DELETE FROM partner_stores WHERE id = ?', [idParam(req.params.id)]);
+  const id = idParam(req.params.id);
+  const [[{ invoices }]] = await pool.query('SELECT COUNT(*) AS invoices FROM partner_invoices WHERE store_id = ?', [id]);
+  if (invoices > 0) {
+    throw new HttpError(409, 'This store has invoices, so it can’t be deleted. Switch it off instead.');
+  }
+  const [result] = await pool.query('DELETE FROM partner_stores WHERE id = ?', [id]);
   if (result.affectedRows === 0) throw new HttpError(404, 'Store not found');
   ok(res, null, 'Store deleted');
 });

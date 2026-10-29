@@ -137,12 +137,20 @@ const saleSchema = z.object({
   channel: z.enum(['local', 'online'], { error: 'Pick the order type' }).default('local'),
   status: z.enum(['in_progress', 'delivered'], { error: 'Unknown status' }).default('in_progress'),
   customer: z.object({
-    fullName: z.string({ error: "Enter the customer's name" }).trim().min(2, "Enter the customer's name").max(120),
+    // Name and number are optional for walk-in sales; left empty they're saved as "nil".
+    fullName: z
+      .string()
+      .trim()
+      .max(120)
+      .nullish()
+      .transform((v) => v || 'nil'),
     gender: z.enum(['male', 'female']).nullish().transform((v) => v ?? null),
     whatsapp: z
-      .string({ error: 'Enter a WhatsApp number' })
+      .string()
       .trim()
-      .regex(/^[0-9+\s-]{10,15}$/, 'Enter a valid WhatsApp number'),
+      .regex(/^$|^[0-9+\s-]{10,15}$/, 'Enter a valid WhatsApp number')
+      .nullish()
+      .transform((v) => v || 'nil'),
     address: z.string({ error: 'Enter the address' }).trim().min(3, 'Enter the address').max(500),
   }),
   items: z
