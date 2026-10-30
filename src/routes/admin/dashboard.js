@@ -82,8 +82,9 @@ const salesBetween = async (start, end) => {
 
 /**
  * All-time money position. Cash in: online orders once delivered (cash on
- * delivery), local sales when entered (paid on the spot), partner payments.
- * Cash out: every production batch and every expense. Receivable: what
+ * delivery), local sales when entered (paid on the spot), partner payments,
+ * money investors put in. Cash out: every production batch, every expense,
+ * investor withdrawals and profit paid to investors. Receivable: what
  * partner stores still owe plus open online orders not yet delivered.
  */
 const cashPosition = async () => {
@@ -101,14 +102,20 @@ const cashPosition = async () => {
     `SELECT COALESCE((SELECT SUM(total_cost) FROM stock_purchases), 0) AS production,
             COALESCE((SELECT SUM(amount) FROM expenses), 0) AS expenses`,
   );
-  const cashIn = n(orders.received) + n(partners.paid);
-  const cashOut = n(out.production) + n(out.expenses);
+  const [[investors]] = await pool.query(
+    `SELECT COALESCE((SELECT SUM(amount) FROM investor_investments WHERE kind = 'invest'), 0) AS invested,
+            COALESCE((SELECT SUM(amount) FROM investor_investments WHERE kind = 'withdraw'), 0) AS withdrawn,
+            COALESCE((SELECT SUM(amount) FROM investor_payouts), 0) AS profitPaid`,
+  );
+  const cashIn = n(orders.received) + n(partners.paid) + n(investors.invested);
+  const cashOut = n(out.production) + n(out.expenses) + n(investors.withdrawn) + n(investors.profitPaid);
   const partnerDue = Math.max(0, n(partners.billed) - n(partners.paid));
   return {
     cashInHand: cashIn - cashOut,
     cashIn,
     cashOut,
     production: n(out.production),
+    investors: { invested: n(investors.invested), withdrawn: n(investors.withdrawn), profitPaid: n(investors.profitPaid) },
     receivable: partnerDue + n(orders.open),
     receivableFrom: { partners: partnerDue, orders: n(orders.open) },
   };

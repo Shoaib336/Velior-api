@@ -245,3 +245,44 @@ CREATE TABLE IF NOT EXISTS partner_payments (
   KEY idx_partner_payments_invoice (invoice_id),
   CONSTRAINT fk_partner_payment_invoice FOREIGN KEY (invoice_id) REFERENCES partner_invoices (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Investors: money in/out and monthly profit payouts (see migration 009).
+CREATE TABLE IF NOT EXISTS investors (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(120) NOT NULL,
+  phone VARCHAR(20) NOT NULL DEFAULT '',
+  profit_rate DECIMAL(5,2) NOT NULL DEFAULT 0.00,  -- % of net investment paid each month
+  note VARCHAR(300) NOT NULL DEFAULT '',
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Money the investor put in ('invest') or took back ('withdraw').
+CREATE TABLE IF NOT EXISTS investor_investments (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  investor_id INT UNSIGNED NOT NULL,
+  kind ENUM('invest','withdraw') NOT NULL DEFAULT 'invest',
+  amount INT UNSIGNED NOT NULL,
+  made_on DATE NOT NULL,
+  note VARCHAR(200) NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_investments_investor (investor_id, made_on),
+  CONSTRAINT fk_investment_investor FOREIGN KEY (investor_id) REFERENCES investors (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Profit paid to the investor for a month ("2026-10"); several part-payments allowed.
+CREATE TABLE IF NOT EXISTS investor_payouts (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  investor_id INT UNSIGNED NOT NULL,
+  month CHAR(7) NOT NULL,
+  amount INT UNSIGNED NOT NULL,
+  paid_on DATE NOT NULL,
+  note VARCHAR(200) NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_payouts_investor (investor_id, month),
+  CONSTRAINT fk_payout_investor FOREIGN KEY (investor_id) REFERENCES investors (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
