@@ -31,7 +31,7 @@ const shape = (e) => ({
   createdAt: e.created_at,
 });
 
-/** ?from&to (YYYY-MM-DD, inclusive) → { expenses, total, page, pageSize, sum } */
+/** ?from&to (YYYY-MM-DD, inclusive)&category → { expenses, total, page, pageSize, sum } */
 router.get('/expenses', async (req, res) => {
   const { page, pageSize, offset } = paging(req.query);
   const where = [];
@@ -44,6 +44,10 @@ router.get('/expenses', async (req, res) => {
     where.push('spent_on <= ?');
     params.push(req.query.to);
   }
+  if (req.query.category) {
+    where.push('category = ?');
+    params.push(String(req.query.category).slice(0, 40));
+  }
   const sql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const [rows] = await pool.query(`SELECT * FROM expenses ${sql} ORDER BY spent_on DESC, id DESC LIMIT ? OFFSET ?`, [
     ...params,
@@ -52,6 +56,24 @@ router.get('/expenses', async (req, res) => {
   ]);
   const [[summary]] = await pool.query(`SELECT COUNT(*) AS total, COALESCE(SUM(amount), 0) AS sum FROM expenses ${sql}`, params);
   ok(res, { expenses: rows.map(shape), total: summary.total, sum: Number(summary.sum), page, pageSize });
+});
+
+// Month-wise totals for the Expenses page, newest month first:
+// [{ month: "2026-10", count, total, byCategory: { Ads: 5000, … } }].
+router.get('/expenses/months', async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(spent_on, '%Y-%m') AS month, category, COUNT(*) AS count, SUM(amount) AS total
+       FROM expenses GROUP BY month, category ORDER BY month DESC, total DESC`,
+  );
+  const months = new Map();
+  for (const r of rows) {
+    const m = months.get(r.month) ?? { month: r.month, count: 0, total: 0, byCategory: {} };
+    m.count += Number(r.count);
+    m.total += Number(r.total);
+    m.byCategory[r.category] = Number(r.total);
+    months.set(r.month, m);
+  }
+  ok(res, { months: [...months.values()] });
 });
 
 router.post('/expenses', async (req, res) => {

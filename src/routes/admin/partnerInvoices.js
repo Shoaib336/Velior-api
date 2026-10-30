@@ -1,11 +1,14 @@
 // Stock supplied to partner stores. Each delivery is an invoice numbered per
 // store (1, 2, 3…); it takes the units off Velior's stock like a sale does,
-// and the store's payments against it are recorded as they come in.
+// and the store's payments against it are recorded as they come in. Lines
+// keep their purchase price for the admin's margins; the printed invoice
+// shows only the sale price.
 import { Router } from 'express';
 import { z } from 'zod';
 import pool, { transaction } from '../../db.js';
 import { HttpError, idParam, ok, parse } from '../../lib/http.js';
 import { dayKey, isDayKey } from '../../lib/dates.js';
+import { linesOf, lockSizes, returnStock as putBack, sizeOf, takeStock } from '../../lib/stock.js';
 
 const router = Router();
 
@@ -34,6 +37,12 @@ const invoiceSchema = z.object({
         size: z.string().trim().min(1).max(30),
         qty: z.number().int('Quantity must be whole units').min(1, 'Quantity must be 1 or more').max(10_000),
         unitPrice: z.number().int('Prices are whole rupees').min(0, "A price can't be negative").max(10_000_000),
+        unitCost: z
+          .number()
+          .int('Purchase prices are whole rupees')
+          .min(0, "A purchase price can't be negative")
+          .max(10_000_000)
+          .nullish(),
       }),
     )
     .min(1, 'Add at least one product')
@@ -51,6 +60,7 @@ const createSchema = invoiceSchema.extend({ payment: paymentSchema.nullish() });
 
 const shapeInvoice = (inv, items, payments) => {
   const received = payments.reduce((n, p) => n + p.amount, 0);
+  const cost = items.reduce((n, i) => n + i.qty * i.unit_cost, 0);
   return {
     id: inv.id,
     storeId: inv.store_id,
@@ -61,12 +71,15 @@ const shapeInvoice = (inv, items, payments) => {
     total: inv.total,
     received,
     pending: Math.max(0, inv.total - received),
+    cost,
+    margin: inv.total - cost,
     items: items.map((i) => ({
       slug: i.slug,
       name: i.product_name,
       size: i.size_label,
       qty: i.qty,
       unitPrice: i.unit_price,
+      unitCost: i.unit_cost,
     })),
     payments: payments.map((p) => ({ id: p.id, amount: p.amount, paidOn: p.paid_on, note: p.note })),
   };
@@ -112,54 +125,29 @@ const loadStore = async (id, conn = pool, { lock = false } = {}) => {
   return row;
 };
 
-/** Units per product id on an invoice's lines (lines of deleted products skipped). */
-const unitsByProduct = async (conn, invoiceId) => {
-  const [rows] = await conn.query(
-    `SELECT product_id, SUM(qty) AS qty FROM partner_invoice_items
-      WHERE invoice_id = ? AND product_id IS NOT NULL GROUP BY product_id`,
-    [invoiceId],
-  );
-  return rows.map((r) => ({ productId: r.product_id, qty: Number(r.qty) }));
-};
-
-const returnStock = async (conn, invoiceId) => {
-  for (const { productId, qty } of await unitsByProduct(conn, invoiceId)) {
-    await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, productId]);
-  }
-};
+const returnStock = async (conn, invoiceId) =>
+  putBack(conn, await linesOf(conn, 'partner_invoice_items', 'invoice_id', invoiceId));
 
 /**
  * Checks every line against the catalogue and the stock on hand, writes the
- * lines, snapshots each product's unit cost and takes the units. Stock is per
- * product, across every size supplied.
+ * lines and takes the units (per size). A line's purchase price is what the
+ * admin entered, else its size's average cost.
  */
 const writeLines = async (conn, invoiceId, lines) => {
   const slugs = [...new Set(lines.map((l) => l.slug))];
-  const [products] = await conn.query('SELECT id, slug, name, stock, unit_cost FROM products WHERE slug IN (?) FOR UPDATE', [
-    slugs,
-  ]);
-  const [sizes] = products.length
-    ? await conn.query('SELECT product_id, label FROM product_sizes WHERE product_id IN (?)', [products.map((p) => p.id)])
-    : [[]];
+  const [products] = await conn.query('SELECT id, slug, name FROM products WHERE slug IN (?) FOR UPDATE', [slugs]);
+  const sizes = await lockSizes(conn, products.map((p) => p.id));
   const bySlug = new Map(products.map((p) => [p.slug, p]));
 
   lines.forEach((line, i) => {
     const product = bySlug.get(line.slug);
     if (!product) throw new HttpError(400, `"${line.slug}" isn't in the catalogue`, { [`items.${i}.slug`]: 'Unknown product' });
-    if (!sizes.some((s) => s.product_id === product.id && s.label === line.size)) {
+    if (!sizeOf(sizes, product.id, line.size)) {
       throw new HttpError(400, `${product.name} has no ${line.size} size`, { [`items.${i}.size`]: 'Unknown size' });
     }
   });
 
-  const wanted = (product) => lines.filter((l) => l.slug === product.slug).reduce((n, l) => n + l.qty, 0);
-  for (const product of products) {
-    if (wanted(product) > product.stock) {
-      throw new HttpError(
-        409,
-        product.stock > 0 ? `Only ${product.stock} of ${product.name} in stock` : `${product.name} is out of stock`,
-      );
-    }
-  }
+  await takeStock(conn, lines.map((l) => ({ productId: bySlug.get(l.slug).id, size: l.size, qty: l.qty })));
 
   await conn.query(
     `INSERT INTO partner_invoice_items (invoice_id, product_id, slug, product_name, size_label, qty, unit_price, unit_cost)
@@ -167,13 +155,11 @@ const writeLines = async (conn, invoiceId, lines) => {
     [
       lines.map((l) => {
         const p = bySlug.get(l.slug);
-        return [invoiceId, p.id, p.slug, p.name, l.size, l.qty, l.unitPrice, p.unit_cost];
+        const unitCost = l.unitCost ?? sizeOf(sizes, p.id, l.size).unit_cost;
+        return [invoiceId, p.id, p.slug, p.name, l.size, l.qty, l.unitPrice, unitCost];
       }),
     ],
   );
-  for (const product of products) {
-    await conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [wanted(product), product.id]);
-  }
 
   return {
     units: lines.reduce((n, l) => n + l.qty, 0),
@@ -204,6 +190,8 @@ router.get('/partner-stores/:id/invoices', async (req, res) => {
       business: sum('total'),
       received: sum('received'),
       pending: sum('pending'),
+      cost: sum('cost'),
+      margin: sum('margin'),
     },
   });
 });

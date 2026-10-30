@@ -6,6 +6,7 @@ import { loadProducts, findPromo } from '../lib/catalogue.js';
 import { HttpError, ok, parse } from '../lib/http.js';
 import { loadOrder, orderNumber, stampCosts } from '../lib/orders.js';
 import { loadSettings } from '../lib/settings.js';
+import { takeStock } from '../lib/stock.js';
 
 const router = Router();
 
@@ -63,18 +64,8 @@ router.post('/orders', async (req, res) => {
       return { ...line, product, name: product.name, unitPrice: size.salePrice ?? size.price };
     });
 
-    // Stock is per product, across every size ordered.
-    for (const product of products) {
-      const wanted = rows.filter((r) => r.slug === product.slug).reduce((n, r) => n + r.qty, 0);
-      if (wanted > product.stock) {
-        throw new HttpError(
-          409,
-          product.stock > 0
-            ? `Only ${product.stock} of ${product.name} left in stock`
-            : `${product.name} is out of stock`,
-        );
-      }
-    }
+    // Stock is per size; 409 when one is short.
+    await takeStock(conn, rows.map((r) => ({ productId: r.product.id, size: r.size, qty: r.qty })));
 
     const promo = body.promo ? await findPromo(conn, body.promo) : null;
     if (body.promo && !promo) throw new HttpError(400, 'Invalid promo code');
@@ -115,10 +106,6 @@ router.post('/orders', async (req, res) => {
       [rows.map((r) => [inserted.insertId, r.product.id, r.slug, r.name, r.size, r.qty, r.unitPrice])],
     );
     await stampCosts(conn, inserted.insertId);
-    for (const product of products) {
-      const wanted = rows.filter((r) => r.slug === product.slug).reduce((n, r) => n + r.qty, 0);
-      await conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [wanted, product.id]);
-    }
 
     return inserted.insertId;
   });

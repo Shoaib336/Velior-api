@@ -11,23 +11,29 @@ export const HIGHLIGHT_KEYS = ['bestFor', 'scentVibe', 'keyHighlights'];
 export const SPEC_KEYS = ['top', 'heart', 'base', 'longevity', 'type', 'sillage'];
 const blank = (keys) => Object.fromEntries(keys.map((k) => [k, '']));
 
+// Stock is per size; the product's `stock` is the total of its sizes.
+// Purchase prices (`unitCost`) only go to the admin.
 const shape = (p, sizes, { admin = false, soldBySize } = {}) => {
   const images = json(p.images, {});
   const detail = json(p.detail, {});
+  const own = sizes.filter((s) => s.product_id === p.id);
   return {
     slug: p.slug,
     name: p.name,
     audience: p.audience,
     isSet: Boolean(p.is_set),
-    stock: p.stock,
-    sizes: sizes
-      .filter((s) => s.product_id === p.id)
-      .map((s) => ({
-        label: s.label,
-        price: s.price,
-        salePrice: s.sale_price,
-        ...(admin && { isActive: Boolean(s.is_active), unitsSold: soldBySize?.get(`${p.id}|${s.label}`) ?? 0 }),
-      })),
+    stock: own.reduce((n, s) => n + s.stock, 0),
+    sizes: own.map((s) => ({
+      label: s.label,
+      price: s.price,
+      salePrice: s.sale_price,
+      stock: s.stock,
+      ...(admin && {
+        unitCost: s.unit_cost,
+        isActive: Boolean(s.is_active),
+        unitsSold: soldBySize?.get(`${p.id}|${s.label}`) ?? 0,
+      }),
+    })),
     excerpt: p.excerpt ?? '',
     notes: json(p.notes, []),
     images: {
@@ -45,8 +51,8 @@ const shape = (p, sizes, { admin = false, soldBySize } = {}) => {
 
 /**
  * Storefront products: visible, with at least one size on sale. Pass `slugs`
- * to limit; pass `lock` (inside a transaction) to take row locks so
- * concurrent orders can't oversell stock. Rows keep their DB `id`.
+ * to limit; pass `lock` (inside a transaction) to lock the product rows.
+ * Rows keep their DB `id`.
  */
 export const loadProducts = async (conn = pool, { slugs, lock = false } = {}) => {
   const params = [];
@@ -82,27 +88,33 @@ export const loadAdminProducts = async (conn = pool, { slug } = {}) => {
   if (products.length === 0) return [];
   const ids = products.map((p) => p.id);
   const [sizes] = await conn.query('SELECT * FROM product_sizes WHERE product_id IN (?) ORDER BY id', [ids]);
+  // Orders and partner-store invoices both count as sold.
   const [sales] = await conn.query(
-    `SELECT oi.product_id, oi.size_label,
-            SUM(CASE WHEN o.status <> 'cancelled' THEN oi.qty ELSE 0 END) AS sold
-       FROM order_items oi JOIN orders o ON o.id = oi.order_id
-      WHERE oi.product_id IN (?)
-      GROUP BY oi.product_id, oi.size_label`,
-    [ids],
+    `SELECT product_id, size_label, SUM(sold) AS sold, MAX(ordered) AS ordered FROM (
+       SELECT oi.product_id, oi.size_label, CASE WHEN o.status <> 'cancelled' THEN oi.qty ELSE 0 END AS sold, 1 AS ordered
+         FROM order_items oi JOIN orders o ON o.id = oi.order_id
+        WHERE oi.product_id IN (?)
+       UNION ALL
+       SELECT product_id, size_label, qty, 0 FROM partner_invoice_items WHERE product_id IN (?)
+     ) s
+     GROUP BY product_id, size_label`,
+    [ids, ids],
   );
   // Units sold per product and per "product|size" (sizes match on label).
+  // Only orders block deleting a product (invoices are kept by name).
   const soldOf = new Map();
   const soldBySize = new Map();
+  const hasOrders = new Set();
   for (const s of sales) {
     soldOf.set(s.product_id, (soldOf.get(s.product_id) ?? 0) + Number(s.sold));
     soldBySize.set(`${s.product_id}|${s.size_label}`, Number(s.sold));
+    if (Number(s.ordered)) hasOrders.add(s.product_id);
   }
   return products.map((p) => ({
     ...shape(p, sizes, { admin: true, soldBySize }),
     isActive: Boolean(p.is_active),
-    unitCost: p.unit_cost ?? 0,
     unitsSold: soldOf.get(p.id) ?? 0,
-    hasOrders: soldOf.has(p.id),
+    hasOrders: hasOrders.has(p.id),
     createdAt: p.created_at,
     updatedAt: p.updated_at,
   }));

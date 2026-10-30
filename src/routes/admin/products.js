@@ -1,6 +1,7 @@
-// The catalogue for the Stock Manager: products, sizes/prices, stock,
-// images and product-page content. Slugs are fixed once created (orders and
-// storefront links use them); products with orders can only be hidden.
+// The catalogue for the Stock Manager: products, sizes with their prices,
+// purchase price and stock, images and product-page content. Slugs are
+// fixed once created (orders and storefront links use them); products with
+// orders can only be hidden.
 import { Router } from 'express';
 import { z } from 'zod';
 import pool, { transaction } from '../../db.js';
@@ -18,11 +19,26 @@ const rupees = (label) =>
     .min(1, `The ${label} must be at least 1`)
     .max(10_000_000, `The ${label} is too large`);
 
+const units = z
+  .number({ error: 'Enter the units in stock' })
+  .int('Stock must be whole units')
+  .min(0, "Stock can't be negative")
+  .max(1_000_000, 'That stock level is too large');
+
+// Stock and purchase price are optional: left out, a size keeps what it has
+// (so switching a size on/off never overwrites stock a sale just took).
 const sizeSchema = z
   .object({
     label: z.string().trim().min(1, 'Enter a size, e.g. 50 ML').max(30),
     price: rupees('price'),
     salePrice: rupees('sale price').nullish().transform((v) => v ?? null),
+    unitCost: z
+      .number({ error: 'Enter the purchase price' })
+      .int('The purchase price must be whole rupees')
+      .min(0, "The purchase price can't be negative")
+      .max(10_000_000, 'The purchase price is too large')
+      .optional(),
+    stock: units.optional(),
     isActive: z.boolean().default(true),
   })
   .refine((s) => s.salePrice === null || s.salePrice < s.price, {
@@ -38,11 +54,6 @@ const fields = {
   audience: z.enum(['unisex', 'men', 'women'], { error: 'Pick a gender' }),
   isSet: z.boolean(),
   isActive: z.boolean(),
-  stock: z
-    .number({ error: 'Enter the units in stock' })
-    .int('Stock must be whole units')
-    .min(0, "Stock can't be negative")
-    .max(1_000_000, 'That stock level is too large'),
   sizes: z
     .array(sizeSchema)
     .min(1, 'Add at least one size')
@@ -81,7 +92,6 @@ const createSchema = z.object({
   ...fields,
   isSet: fields.isSet.default(false),
   isActive: fields.isActive.default(true),
-  stock: fields.stock.default(0),
   excerpt: fields.excerpt.default(''),
   notes: fields.notes.default([]),
   images: fields.images.default({ card: null, portrait: null, gallery: [] }),
@@ -97,7 +107,6 @@ const columns = (body) => {
   if (body.audience !== undefined) cols.audience = body.audience;
   if (body.isSet !== undefined) cols.is_set = body.isSet;
   if (body.isActive !== undefined) cols.is_active = body.isActive;
-  if (body.stock !== undefined) cols.stock = body.stock;
   if (body.excerpt !== undefined) cols.excerpt = body.excerpt;
   if (body.notes !== undefined) cols.notes = JSON.stringify(body.notes);
   if (body.images !== undefined) {
@@ -111,11 +120,22 @@ const columns = (body) => {
   return cols;
 };
 
+/** Replaces the sizes; a size sent without stock / purchase price keeps its saved ones (matched on label). */
 const saveSizes = async (conn, productId, sizes) => {
-  await conn.query('DELETE FROM product_sizes WHERE product_id = ?', [productId]);
-  await conn.query('INSERT INTO product_sizes (product_id, label, price, sale_price, is_active) VALUES ?', [
-    sizes.map((s) => [productId, s.label, s.price, s.salePrice, s.isActive]),
+  const [saved] = await conn.query('SELECT label, stock, unit_cost FROM product_sizes WHERE product_id = ? FOR UPDATE', [
+    productId,
   ]);
+  const old = new Map(saved.map((s) => [s.label.toLowerCase(), s]));
+  await conn.query('DELETE FROM product_sizes WHERE product_id = ?', [productId]);
+  await conn.query(
+    'INSERT INTO product_sizes (product_id, label, price, sale_price, stock, unit_cost, is_active) VALUES ?',
+    [
+      sizes.map((s) => {
+        const was = old.get(s.label.toLowerCase());
+        return [productId, s.label, s.price, s.salePrice, s.stock ?? was?.stock ?? 0, s.unitCost ?? was?.unit_cost ?? 0, s.isActive];
+      }),
+    ],
+  );
 };
 
 const findId = async (conn, slugValue, { lock = false } = {}) => {

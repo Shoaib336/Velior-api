@@ -1,9 +1,10 @@
-// Production batches ("stock purchases"): units Velior has made or bought
-// in, where, and what they cost — as one cost per unit or as a breakdown
-// (oil, bottles, packaging…) that adds up to the batch total. A batch is
-// either still being made ("ordered": budget committed, no stock yet) or
-// "received": its units are on the shelf and its cost is folded into the
-// product's average unit cost, which new sales copy for cost of goods.
+// Production batches ("stock purchases"): units of one product size Velior
+// has made or bought in, where, and what they cost — as one cost per unit or
+// as a breakdown (oil, bottles, packaging…) that adds up to the batch total.
+// A batch is either still being made ("ordered": budget committed, no stock
+// yet) or "received": its units are on that size's shelf and its cost is
+// folded into the size's average purchase price, which new sales copy for
+// cost of goods.
 import { Router } from 'express';
 import { z } from 'zod';
 import pool, { transaction } from '../../db.js';
@@ -51,6 +52,7 @@ const needsCost = (b) => b.unitCost !== undefined || b.costs?.length > 0;
 const createSchema = z
   .object({
     slug: z.string({ error: 'Pick a product' }).trim().min(1, 'Pick a product').max(60),
+    size: z.string({ error: 'Pick a size' }).trim().min(1, 'Pick a size').max(30),
     ...fields,
     supplier: fields.supplier.default(''),
     note: fields.note.default(''),
@@ -78,6 +80,7 @@ const shape = (r) => ({
   id: r.id,
   slug: r.slug,
   productName: r.product_name,
+  size: r.size_label,
   qty: r.qty,
   unitCost: r.unit_cost,
   totalCost: r.total_cost,
@@ -97,17 +100,27 @@ const findOne = async (conn, id) => {
   return shape(row);
 };
 
-/** Puts a batch's units on the shelf and re-averages the product's unit cost. */
-const receive = async (conn, productId, { qty, totalCost }) => {
-  const [[product]] = await conn.query('SELECT stock, unit_cost FROM products WHERE id = ? FOR UPDATE', [productId]);
-  const units = product.stock + qty;
-  // Weighted average; a product with no recorded cost just takes this batch's.
+const lockSize = async (conn, productId, size) => {
+  const [[row]] = await conn.query(
+    `SELECT ps.id, ps.stock, ps.unit_cost, p.name FROM product_sizes ps JOIN products p ON p.id = ps.product_id
+      WHERE ps.product_id = ? AND ps.label = ? FOR UPDATE`,
+    [productId, size],
+  );
+  return row;
+};
+
+/** Puts a batch's units on its size's shelf and re-averages that size's purchase price. */
+const receive = async (conn, productId, size, { qty, totalCost }) => {
+  const row = await lockSize(conn, productId, size);
+  if (!row) throw new HttpError(409, `This product no longer has a ${size} size, so the batch has nowhere to go`);
+  const units = row.stock + qty;
+  // Weighted average; a size with no recorded cost just takes this batch's.
   const unitCost =
-    product.unit_cost > 0 && product.stock > 0
-      ? Math.round((product.stock * product.unit_cost + totalCost) / units)
+    row.unit_cost > 0 && row.stock > 0
+      ? Math.round((row.stock * row.unit_cost + totalCost) / units)
       : Math.round(totalCost / qty);
-  await conn.query('UPDATE products SET stock = ?, unit_cost = ? WHERE id = ?', [units, unitCost, productId]);
-  return { stock: units, unitCost };
+  await conn.query('UPDATE product_sizes SET stock = ?, unit_cost = ? WHERE id = ?', [units, unitCost, row.id]);
+  return { size, stock: units, unitCost };
 };
 
 // Filters: q (product, supplier or note), status, slug, from/to (batch date).
@@ -178,15 +191,17 @@ router.post('/stock-purchases', async (req, res) => {
   const result = await transaction(async (conn) => {
     const [[product]] = await conn.query('SELECT id, name FROM products WHERE slug = ? FOR UPDATE', [body.slug]);
     if (!product) throw fieldError(404, 'slug', 'Product not found');
+    if (!(await lockSize(conn, product.id, body.size))) throw fieldError(400, 'size', `${product.name} has no ${body.size} size`);
 
     const received = body.status === 'received';
     const [inserted] = await conn.query(
       `INSERT INTO stock_purchases
-         (product_id, product_name, qty, unit_cost, total_cost, costs, supplier, note, purchased_on, status, received_on)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (product_id, product_name, size_label, qty, unit_cost, total_cost, costs, supplier, note, purchased_on, status, received_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         product.id,
         product.name,
+        body.size,
         body.qty,
         cost.unitCost,
         cost.totalCost,
@@ -198,7 +213,7 @@ router.post('/stock-purchases', async (req, res) => {
         received ? body.purchasedOn : null,
       ],
     );
-    const stock = received ? await receive(conn, product.id, { qty: body.qty, totalCost: cost.totalCost }) : null;
+    const stock = received ? await receive(conn, product.id, body.size, { qty: body.qty, totalCost: cost.totalCost }) : null;
     return { purchase: await findOne(conn, inserted.insertId), product: stock && { slug: body.slug, ...stock } };
   });
   ok(res, result, body.status === 'received' ? 'Added to stock' : 'Batch saved', 201);
@@ -253,7 +268,7 @@ router.post('/stock-purchases/:id/receive', async (req, res) => {
     if (!row.product_id) throw new HttpError(409, 'This product was deleted, so the batch has nowhere to go');
     if (receivedOn < row.purchased_on) throw fieldError(400, 'receivedOn', "It can't arrive before it was ordered");
     await conn.query("UPDATE stock_purchases SET status = 'received', received_on = ? WHERE id = ?", [receivedOn, id]);
-    const stock = await receive(conn, row.product_id, { qty: row.qty, totalCost: row.total_cost });
+    const stock = await receive(conn, row.product_id, row.size_label, { qty: row.qty, totalCost: row.total_cost });
     return { purchase: await findOne(conn, id), product: { slug: row.slug, ...stock } };
   });
   ok(res, result, 'Added to stock');
@@ -266,12 +281,15 @@ router.delete('/stock-purchases/:id', async (req, res) => {
   await transaction(async (conn) => {
     const [[row]] = await conn.query('SELECT * FROM stock_purchases WHERE id = ? FOR UPDATE', [id]);
     if (!row) throw new HttpError(404, 'Batch not found');
-    if (row.product_id && row.status === 'received') {
-      const [[product]] = await conn.query('SELECT stock, name FROM products WHERE id = ? FOR UPDATE', [row.product_id]);
-      if (product && product.stock < row.qty) {
-        throw new HttpError(409, `Only ${product.stock} of ${product.name} left — some of this batch was already sold`);
+    const size = row.product_id && row.status === 'received' ? await lockSize(conn, row.product_id, row.size_label) : null;
+    if (size) {
+      if (size.stock < row.qty) {
+        throw new HttpError(
+          409,
+          `Only ${size.stock} of ${size.name} ${row.size_label} left — some of this batch was already sold`,
+        );
       }
-      await conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [row.qty, row.product_id]);
+      await conn.query('UPDATE product_sizes SET stock = stock - ? WHERE id = ?', [row.qty, size.id]);
     }
     await conn.query('DELETE FROM stock_purchases WHERE id = ?', [id]);
   });

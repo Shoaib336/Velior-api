@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS products (
   notes JSON NULL,
   images JSON NULL,
   detail JSON NULL,
-  stock INT UNSIGNED NOT NULL DEFAULT 0,
-  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,  -- average purchase cost per unit
+  stock INT UNSIGNED NOT NULL DEFAULT 0,      -- unused since 008: stock is per size
+  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,  -- unused since 008: cost is per size
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS product_sizes (
   label VARCHAR(30) NOT NULL,
   price INT UNSIGNED NOT NULL,
   sale_price INT UNSIGNED DEFAULT NULL,
+  stock INT UNSIGNED NOT NULL DEFAULT 0,
+  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,  -- average purchase cost per unit
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE KEY uq_size (product_id, label),
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS orders (
   whatsapp VARCHAR(20) NOT NULL,
   address TEXT NOT NULL,
   payment_method VARCHAR(40) NOT NULL DEFAULT 'Cash on Delivery',
-  channel ENUM('online','local') NOT NULL DEFAULT 'online',
+  channel ENUM('online','local','pr') NOT NULL DEFAULT 'online',
   status ENUM('confirmed','in_progress','delivered','cancelled') NOT NULL DEFAULT 'confirmed',
   estimated_delivery VARCHAR(60) NOT NULL DEFAULT '3-5 Days',
   promo_code VARCHAR(40) DEFAULT NULL,
@@ -86,7 +88,7 @@ CREATE TABLE IF NOT EXISTS order_items (
   size_label VARCHAR(30) NOT NULL,
   qty INT UNSIGNED NOT NULL,
   unit_price INT UNSIGNED NOT NULL,
-  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,  -- product's unit cost when sold
+  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,  -- purchase price per unit when sold
   PRIMARY KEY (id),
   KEY idx_items_order (order_id),
   KEY idx_items_slug (slug),
@@ -159,6 +161,7 @@ CREATE TABLE IF NOT EXISTS stock_purchases (
   id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   product_id INT UNSIGNED DEFAULT NULL,
   product_name VARCHAR(120) NOT NULL,
+  size_label VARCHAR(30) NOT NULL DEFAULT '',
   qty INT UNSIGNED NOT NULL,
   unit_cost INT UNSIGNED NOT NULL,
   total_cost INT UNSIGNED NOT NULL DEFAULT 0,
@@ -224,7 +227,7 @@ CREATE TABLE IF NOT EXISTS partner_invoice_items (
   size_label VARCHAR(30) NOT NULL,
   qty INT UNSIGNED NOT NULL,
   unit_price INT UNSIGNED NOT NULL,
-  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,   -- product's unit cost when supplied
+  unit_cost INT UNSIGNED NOT NULL DEFAULT 0,   -- purchase price per unit when supplied
   PRIMARY KEY (id),
   KEY idx_partner_items_invoice (invoice_id),
   CONSTRAINT fk_partner_item_invoice FOREIGN KEY (invoice_id) REFERENCES partner_invoices (id) ON DELETE CASCADE,

@@ -1,7 +1,7 @@
 // The order shape shared by checkout, tracking and the admin, plus the
 // stock moves a status change implies.
 import pool from '../db.js';
-import { HttpError } from './http.js';
+import { linesOf, returnStock as putBack, takeStock as take } from './stock.js';
 
 export const STATUSES = ['confirmed', 'in_progress', 'delivered', 'cancelled'];
 
@@ -13,41 +13,45 @@ export const orderNumber = (date, id) => {
 
 const iso = (value) => (value ? new Date(value).toISOString() : null);
 
-export const shapeOrder = (o, items) => ({
-  number: o.order_number,
-  status: o.status,
-  placedAt: iso(o.placed_at),
-  confirmedAt: iso(o.confirmed_at),
-  inProgressAt: iso(o.in_progress_at),
-  deliveredAt: iso(o.delivered_at),
-  cancelledAt: iso(o.cancelled_at),
-  customer: { fullName: o.customer_name, gender: o.customer_gender, whatsapp: o.whatsapp, address: o.address },
-  paymentMethod: o.payment_method,
-  channel: o.channel ?? 'online',
-  estimatedDelivery: o.estimated_delivery,
-  promoCode: o.promo_code,
-  totals: {
-    items: o.items_count,
-    subtotal: o.subtotal,
-    discountRate: Number(o.discount_rate),
-    discount: o.discount,
-    delivery: o.delivery_fee,
-    total: o.total,
-  },
-  items: items
-    .filter((i) => i.order_id === o.id)
-    .map((i) => ({
+/** `admin` adds purchase prices (per line, and the order's total cost) — never sent to customers. */
+export const shapeOrder = (o, items, { admin = false } = {}) => {
+  const own = items.filter((i) => i.order_id === o.id);
+  return {
+    number: o.order_number,
+    status: o.status,
+    placedAt: iso(o.placed_at),
+    confirmedAt: iso(o.confirmed_at),
+    inProgressAt: iso(o.in_progress_at),
+    deliveredAt: iso(o.delivered_at),
+    cancelledAt: iso(o.cancelled_at),
+    customer: { fullName: o.customer_name, gender: o.customer_gender, whatsapp: o.whatsapp, address: o.address },
+    paymentMethod: o.payment_method,
+    channel: o.channel ?? 'online',
+    estimatedDelivery: o.estimated_delivery,
+    promoCode: o.promo_code,
+    totals: {
+      items: o.items_count,
+      subtotal: o.subtotal,
+      discountRate: Number(o.discount_rate),
+      discount: o.discount,
+      delivery: o.delivery_fee,
+      total: o.total,
+      ...(admin && { cost: own.reduce((n, i) => n + i.qty * i.unit_cost, 0) }),
+    },
+    items: own.map((i) => ({
       slug: i.slug,
       name: i.product_name,
       size: i.size_label,
       qty: i.qty,
       unitPrice: i.unit_price,
+      ...(admin && { unitCost: i.unit_cost }),
       audience: i.audience ?? 'unisex',
     })),
-});
+  };
+};
 
 /** Order rows → full orders (items + each item's audience) in the same order. */
-export const withItems = async (orders, conn = pool) => {
+export const withItems = async (orders, conn = pool, options) => {
   if (orders.length === 0) return [];
   const [items] = await conn.query(
     `SELECT oi.*, p.audience
@@ -55,60 +59,31 @@ export const withItems = async (orders, conn = pool) => {
       WHERE oi.order_id IN (?) ORDER BY oi.id`,
     [orders.map((o) => o.id)],
   );
-  return orders.map((o) => shapeOrder(o, items));
+  return orders.map((o) => shapeOrder(o, items, options));
 };
 
-export const loadOrder = async (where, params, conn = pool) => {
+export const loadOrder = async (where, params, conn = pool, options) => {
   const [rows] = await conn.query(`SELECT * FROM orders WHERE ${where} LIMIT 1`, params);
-  return rows[0] ? (await withItems(rows, conn))[0] : null;
+  return rows[0] ? (await withItems(rows, conn, options))[0] : null;
 };
 
 /**
- * Copies each product's current unit cost onto the order's lines, so cost of
- * goods stays what it was when sold even after later purchases change it.
+ * Copies each size's current purchase price onto the order's lines, so cost
+ * of goods stays what it was when sold even after later batches change it.
  */
 export const stampCosts = (conn, orderId) =>
   conn.query(
-    `UPDATE order_items oi JOIN products p ON p.id = oi.product_id
-        SET oi.unit_cost = p.unit_cost
+    `UPDATE order_items oi JOIN product_sizes ps ON ps.product_id = oi.product_id AND ps.label = oi.size_label
+        SET oi.unit_cost = ps.unit_cost
       WHERE oi.order_id = ?`,
     [orderId],
   );
 
-/** Units per product id for an order's lines (lines of deleted products skipped). */
-const unitsByProduct = async (conn, orderId) => {
-  const [rows] = await conn.query(
-    `SELECT product_id, SUM(qty) AS qty FROM order_items
-      WHERE order_id = ? AND product_id IS NOT NULL GROUP BY product_id`,
-    [orderId],
-  );
-  return rows.map((r) => ({ productId: r.product_id, qty: Number(r.qty) }));
-};
-
 /** Cancelling puts the order's units back on the shelf. */
-export const returnStock = async (conn, orderId) => {
-  for (const { productId, qty } of await unitsByProduct(conn, orderId)) {
-    await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, productId]);
-  }
-};
+export const returnStock = async (conn, orderId) => putBack(conn, await linesOf(conn, 'order_items', 'order_id', orderId));
 
-/** Reopening a cancelled order takes its units again — 409 if any are short. */
-export const takeStock = async (conn, orderId) => {
-  const units = await unitsByProduct(conn, orderId);
-  if (units.length === 0) return;
-  const [products] = await conn.query('SELECT id, name, stock FROM products WHERE id IN (?) FOR UPDATE', [
-    units.map((u) => u.productId),
-  ]);
-  for (const { productId, qty } of units) {
-    const p = products.find((x) => x.id === productId);
-    if (p && p.stock < qty) {
-      throw new HttpError(
-        409,
-        `Can't reopen: ${p.name} has ${p.stock} in stock but this order needs ${qty}. Restock it first.`,
-      );
-    }
-  }
-  for (const { productId, qty } of units) {
-    await conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [qty, productId]);
-  }
-};
+/** Reopening a cancelled order takes its units again — 409 if any size is short. */
+export const takeStock = async (conn, orderId) =>
+  take(conn, await linesOf(conn, 'order_items', 'order_id', orderId), {
+    prefix: "Can't reopen — restock first: ",
+  });

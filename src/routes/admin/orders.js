@@ -4,8 +4,9 @@ import { z } from 'zod';
 import pool, { transaction } from '../../db.js';
 import { HttpError, ok, paging, parse } from '../../lib/http.js';
 import { addDays, dayKey, isDayKey, startOf } from '../../lib/dates.js';
-import { STATUSES, loadOrder, orderNumber, returnStock, stampCosts, takeStock, withItems } from '../../lib/orders.js';
+import { STATUSES, loadOrder, orderNumber, returnStock, takeStock, withItems } from '../../lib/orders.js';
 import { loadSettings } from '../../lib/settings.js';
+import { lockSizes, sizeOf, takeStock as takeUnits } from '../../lib/stock.js';
 
 const router = Router();
 
@@ -19,6 +20,12 @@ const MOVES = {
   delivered: ['in_progress'],
   cancelled: ['confirmed'],
 };
+
+// Orders here carry purchase prices; the storefront's never do.
+const ADMIN = { admin: true };
+
+// What a hand-entered sale was paid with, by channel. PR stock is gifted.
+const PAYMENT = { local: 'Cash', online: 'Cash on Delivery', pr: 'PR (gifted)' };
 
 const like = (value) => `%${value.replace(/[\\%_]/g, '\\$&')}%`;
 
@@ -37,7 +44,7 @@ const filterSql = (query) => {
     where.push('o.status IN (?)');
     params.push(statuses);
   }
-  if (['online', 'local'].includes(query.channel)) {
+  if (['online', 'local', 'pr'].includes(query.channel)) {
     where.push('o.channel = ?');
     params.push(query.channel);
   }
@@ -98,8 +105,12 @@ router.get('/orders', async (req, res) => {
   );
   const [[summary]] = await pool.query(
     `SELECT COUNT(*) AS total,
-            COALESCE(SUM(CASE WHEN o.status = 'delivered' THEN o.total ELSE 0 END), 0) AS value
-       FROM orders o ${filter.sql}`,
+            COALESCE(SUM(CASE WHEN o.status = 'delivered' THEN o.total ELSE 0 END), 0) AS value,
+            COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN o.total ELSE 0 END), 0) AS sale,
+            COALESCE(SUM(CASE WHEN o.status <> 'cancelled' THEN c.cost ELSE 0 END), 0) AS cost
+       FROM orders o
+       LEFT JOIN (SELECT order_id, SUM(qty * unit_cost) AS cost FROM order_items GROUP BY order_id) c ON c.order_id = o.id
+       ${filter.sql}`,
     filter.params,
   );
 
@@ -116,25 +127,33 @@ router.get('/orders', async (req, res) => {
   counts.all = byStatus.reduce((n, r) => n + r.n, 0);
 
   ok(res, {
-    orders: await withItems(rows),
+    orders: await withItems(rows, pool, ADMIN),
     total: summary.total,
     page,
     pageSize,
     counts,
     revenue: { delivered },
-    summary: { count: summary.total, value: Number(summary.value) },
+    // sale / cost / margin leave cancelled orders out.
+    summary: {
+      count: summary.total,
+      value: Number(summary.value),
+      sale: Number(summary.sale),
+      cost: Number(summary.cost),
+      margin: Number(summary.sale) - Number(summary.cost),
+    },
   });
 });
 
-// "Add New Sale": an order entered by hand — a walk-in (local) sale or one
-// taken over the phone/WhatsApp (online). Prices are what the admin typed,
-// not the catalogue's, so discounts given in person are kept.
+// "Add New Sale": an order entered by hand — a walk-in (local) sale, one
+// taken over the phone/WhatsApp (online), or stock gifted for PR. Prices are
+// what the admin typed, not the catalogue's, so discounts given in person are
+// kept. A line's purchase price defaults to its size's average cost.
 const saleSchema = z.object({
   placedAt: z
     .string({ error: 'Pick the sale date' })
     .refine(isDayKey, 'Pick the sale date')
     .refine((d) => d <= dayKey(new Date()), "The sale date can't be in the future"),
-  channel: z.enum(['local', 'online'], { error: 'Pick the order type' }).default('local'),
+  channel: z.enum(['local', 'online', 'pr'], { error: 'Pick the order type' }).default('local'),
   status: z.enum(['in_progress', 'delivered'], { error: 'Unknown status' }).default('in_progress'),
   customer: z.object({
     // Name and number are optional for walk-in sales; left empty they're saved as "nil".
@@ -160,6 +179,12 @@ const saleSchema = z.object({
         size: z.string().trim().min(1).max(30),
         qty: z.number().int('Quantity must be whole units').min(1, 'Quantity must be 1 or more').max(1000),
         unitPrice: z.number().int('Prices are whole rupees').min(0, "A price can't be negative").max(10_000_000),
+        unitCost: z
+          .number()
+          .int('Purchase prices are whole rupees')
+          .min(0, "A purchase price can't be negative")
+          .max(10_000_000)
+          .nullish(),
       }),
     )
     .min(1, 'Add at least one product')
@@ -173,30 +198,20 @@ router.post('/orders', async (req, res) => {
 
   const id = await transaction(async (conn) => {
     const slugs = [...new Set(body.items.map((i) => i.slug))];
-    const [products] = await conn.query('SELECT id, slug, name, stock FROM products WHERE slug IN (?) FOR UPDATE', [slugs]);
-    const [sizes] = products.length
-      ? await conn.query('SELECT product_id, label FROM product_sizes WHERE product_id IN (?)', [products.map((p) => p.id)])
-      : [[]];
+    const [products] = await conn.query('SELECT id, slug, name FROM products WHERE slug IN (?) FOR UPDATE', [slugs]);
+    const sizes = await lockSizes(conn, products.map((p) => p.id));
     const bySlug = new Map(products.map((p) => [p.slug, p]));
 
     body.items.forEach((line, i) => {
       const product = bySlug.get(line.slug);
       if (!product) throw new HttpError(400, `"${line.slug}" isn't in the catalogue`, { [`items.${i}.slug`]: 'Unknown product' });
-      if (!sizes.some((s) => s.product_id === product.id && s.label === line.size)) {
+      if (!sizeOf(sizes, product.id, line.size)) {
         throw new HttpError(400, `${product.name} has no ${line.size} size`, { [`items.${i}.size`]: 'Unknown size' });
       }
     });
 
-    // Stock is per product, across every size sold.
-    for (const product of products) {
-      const wanted = body.items.filter((l) => l.slug === product.slug).reduce((n, l) => n + l.qty, 0);
-      if (wanted > product.stock) {
-        throw new HttpError(
-          409,
-          product.stock > 0 ? `Only ${product.stock} of ${product.name} in stock` : `${product.name} is out of stock`,
-        );
-      }
-    }
+    // Stock is per size; 409 when one is short.
+    await takeUnits(conn, body.items.map((l) => ({ productId: bySlug.get(l.slug).id, size: l.size, qty: l.qty })));
 
     const items = body.items.reduce((n, l) => n + l.qty, 0);
     const subtotal = body.items.reduce((n, l) => n + l.qty * l.unitPrice, 0);
@@ -218,7 +233,7 @@ router.post('/orders', async (req, res) => {
         body.customer.gender,
         body.customer.whatsapp,
         body.customer.address,
-        body.channel === 'local' ? 'Cash' : 'Cash on Delivery',
+        PAYMENT[body.channel],
         body.channel,
         body.status,
         items,
@@ -237,27 +252,23 @@ router.post('/orders', async (req, res) => {
     await conn.query('UPDATE orders SET order_number = ? WHERE id = ?', [orderNumber(placedAt, inserted.insertId), inserted.insertId]);
 
     await conn.query(
-      'INSERT INTO order_items (order_id, product_id, slug, product_name, size_label, qty, unit_price) VALUES ?',
+      'INSERT INTO order_items (order_id, product_id, slug, product_name, size_label, qty, unit_price, unit_cost) VALUES ?',
       [
         body.items.map((l) => {
           const p = bySlug.get(l.slug);
-          return [inserted.insertId, p.id, p.slug, p.name, l.size, l.qty, l.unitPrice];
+          const unitCost = l.unitCost ?? sizeOf(sizes, p.id, l.size).unit_cost;
+          return [inserted.insertId, p.id, p.slug, p.name, l.size, l.qty, l.unitPrice, unitCost];
         }),
       ],
     );
-    await stampCosts(conn, inserted.insertId);
-    for (const product of products) {
-      const wanted = body.items.filter((l) => l.slug === product.slug).reduce((n, l) => n + l.qty, 0);
-      await conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [wanted, product.id]);
-    }
     return inserted.insertId;
   });
 
-  ok(res, { order: await loadOrder('id = ?', [id]) }, 'Sale added', 201);
+  ok(res, { order: await loadOrder('id = ?', [id], pool, ADMIN) }, 'Sale added', 201);
 });
 
 router.get('/orders/:number', async (req, res) => {
-  const order = await loadOrder('order_number = ?', [normaliseNumber(req.params.number)]);
+  const order = await loadOrder('order_number = ?', [normaliseNumber(req.params.number)], pool, ADMIN);
   if (!order) throw new HttpError(404, 'Order not found');
   ok(res, { order });
 });
@@ -303,7 +314,7 @@ router.patch('/orders/:number', async (req, res) => {
     }
 
     if (sets.length) await conn.query(`UPDATE orders SET ${sets.join(', ')} WHERE id = ?`, [...params, row.id]);
-    return loadOrder('id = ?', [row.id], conn);
+    return loadOrder('id = ?', [row.id], conn, ADMIN);
   });
 
   ok(res, { order }, 'Order updated');
