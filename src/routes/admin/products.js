@@ -72,6 +72,8 @@ const fields = {
     card: imageUrl.nullish(),
     portrait: imageUrl.nullish(),
     gallery: z.array(imageUrl).max(3, 'Up to 3 gallery images').default([]),
+    // One photo per size, keyed by the size's label ("50 ML", "5 x 5 ML").
+    sizes: z.record(z.string().trim().min(1).max(30), imageUrl).default({}),
   }),
   detail: z.object({
     description: text(2000).default(''),
@@ -94,7 +96,7 @@ const createSchema = z.object({
   isActive: fields.isActive.default(true),
   excerpt: fields.excerpt.default(''),
   notes: fields.notes.default([]),
-  images: fields.images.default({ card: null, portrait: null, gallery: [] }),
+  images: fields.images.default({ card: null, portrait: null, gallery: [], sizes: {} }),
   detail: fields.detail.default({ description: '', highlights: {}, specs: {} }),
 });
 
@@ -114,6 +116,7 @@ const columns = (body) => {
       card: toStoredUrl(body.images.card),
       portrait: toStoredUrl(body.images.portrait),
       gallery: body.images.gallery.map(toStoredUrl),
+      sizes: Object.fromEntries(Object.entries(body.images.sizes).map(([label, url]) => [label, toStoredUrl(url)])),
     });
   }
   if (body.detail !== undefined) cols.detail = JSON.stringify(body.detail);

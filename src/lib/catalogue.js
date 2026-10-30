@@ -40,6 +40,7 @@ const shape = (p, sizes, { admin = false, soldBySize } = {}) => {
       card: toPublicUrl(images.card),
       portrait: toPublicUrl(images.portrait),
       gallery: (images.gallery ?? []).map(toPublicUrl),
+      sizes: Object.fromEntries(Object.entries(images.sizes ?? {}).map(([label, url]) => [label, toPublicUrl(url)])),
     },
     detail: {
       description: detail.description ?? '',
